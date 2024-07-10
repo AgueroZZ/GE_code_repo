@@ -1,0 +1,563 @@
+---
+title: "UKB Application"
+output: pdf
+editor_options:
+  chunk_output_type: console
+---
+
+```{r, eval=FALSE}
+.libPaths(c("~/lib", .libPaths()))
+### Location:
+biobank_location <- "/biobank/ziangzhang/"
+geno_path <- biobank_location
+plink <- paste0(biobank_location, "plink2")
+plink19 <- paste0(biobank_location, "plink")
+result_path <- "/u/ziangzhang/eu_result/"
+data_path <- "/u/ziangzhang/eu_data/"
+```
+
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(hudson)
+library(tidyverse)
+library(stringr)
+library(data.table)
+library(tidyverse)
+library(bigsnpr)
+library(bigstatsr)
+library(progress)
+library(foreach)
+library(parallel)
+library(qqman)
+library(HardyWeinberg)
+library(SPCompute)
+library(Hmisc)
+```
+
+
+
+### *Code*
+
+
+First, process the phenotype data:
+```{r, eval=FALSE}
+bd <- read.table(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", nrows = 3)
+bd_names <- names(bd)
+names_want <- grep("f.20002.0.",bd_names,value = T)
+bd_want <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_want))
+check_asthma <- function(row){
+  if(any(na.omit(row) %in% 1111)) 1
+  else 0
+}
+check_hypertension <- function(row){
+  if(any(na.omit(row) %in% 1065)) 1
+  else 0
+}
+asthma <- apply(bd_want[,-1], 1, check_asthma)
+ncol_bd <- ncol(bd_want)
+hypertension <- apply(bd_want[,-1], 1, check_hypertension)
+pheno_data <- data.frame(ID = bd_want$f.eid, asthma = asthma, hypertension = hypertension)
+names_want2 <- grep("f.21001.0.",bd_names,value = T)
+BMI_data <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_want2))
+names(BMI_data) <- c("ID", "BMI")
+pheno_data <- merge(pheno_data, BMI_data, by = "ID")
+names_want3 <- grep("f.21022.",bd_names,value = T)
+age_data <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_want3))
+names(age_data) <- c("ID", "age")
+pheno_data <- merge(pheno_data, age_data, by = "ID")
+names_want_sex <- grep("f.22001.",bd_names,value = T)
+sex_data <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_want_sex))
+names(sex_data) <- c("ID", "sex")
+pheno_data <- merge(pheno_data, sex_data, by = "ID")
+
+### Self-reported cholesterol:
+check_self_reported_cholesterol <- function(row){
+  if(any(na.omit(row) %in% 1473)) 1
+  else 0
+}
+self_reported_cholesterol <- apply(bd_want[,-1], 1, check_self_reported_cholesterol)
+self_reported_cholesterol_data <- data.frame(ID = bd_want$f.eid, self_reported_cholesterol = self_reported_cholesterol)
+pheno_data <- merge(pheno_data, self_reported_cholesterol_data, by = "ID")
+```
+
+Selection of individuals:
+```{r, eval=FALSE}
+names_want_pop <- grep("f.21000.0",bd_names,value = T)
+names_want_pop_genetic_confirmed <- grep("f.22006",bd_names,value = T)
+names_want_pop_kin <- grep("f.22021.0.0", bd_names,value = T)
+pop_want <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_want_pop, names_want_pop_genetic_confirmed, names_want_pop_kin))
+pop_want_European <- pop_want %>% filter(f.21000.0.0 == 1001, !is.na(f.22006.0.0))
+pop_want_European <- pop_want_European %>% filter(f.22021.0.0 == 0)
+European_ID <- pop_want_European$f.eid
+pheno_data <- pheno_data %>% filter(ID %in% European_ID)
+```
+
+Merge the genotype data for the selected individuals:
+```{r, eval=FALSE}
+matrix_to_write <- cbind(European_ID,European_ID)
+write.table(x = matrix_to_write, file = paste0(geno_path, "self_report_European.txt"), row.names = F, col.names = F)
+result <- NULL
+setwd("/biobank/ziangzhang")
+for (i in 1:22) {
+  i_chromo <- paste0("c",i)
+  i_selected_name <- paste0(paste0("selected_",i_chromo),"_European")
+  system(paste0(plink,
+                paste(" --bfile", i_chromo),
+                " --keep self_report_European.txt",
+                " --make-bed",
+                paste(" --out", i_selected_name)))
+}
+system(paste0(plink19,
+              " --bfile ", "selected_c1_European",
+              " --merge-list ", "merge_list_European.txt",
+              " --make-bed",
+              " --out ", "self_European_merged_data"))
+```
+
+
+Filter out SNPs with HWD, low MAF or low genotyping rate, and individuals with high missing rate:
+```{r, eval=FALSE}
+system(paste0(plink,
+              paste(" --bfile", "self_European_merged_data"),
+              " --hwe 1e-50",
+              " --maf 0.01",
+              " --geno 0.2",
+              " --mind 0.2",
+              " --make-bed ",
+              paste(" --out", "self_European_filtered_data_afterSNP_QC")
+))
+```
+
+Run PCA:
+```{r eval=FALSE}
+system(paste0(plink,
+              " --bfile ", "self_European_filtered_data_afterSNP_QC",
+              " --pca approx 4 ",
+              " --make-bed",
+              " --out ", "self_eur_PCA"))
+newPCs <- read.table(file = paste0(geno_path, "self_eur_PCA.eigenvec"), header = F)
+colnames(newPCs) <- c("FID", "IID", "PC1", "PC2", "PC3", "PC4")
+newPCs$ID <- newPCs$IID
+final_data <- inner_join(newPCs, pheno_data, by = "ID")
+save(final_data, file = paste0(data_path, "final_data.rda"))
+```
+
+Write out the phenotype for GWAS:
+```{r eval=FALSE}
+load(file = paste0(data_path, "final.rda"))
+final_data <- pheno_data
+colnames(final_data)[1] <- "IID"
+final_data <- cbind(FID = final_data$IID ,final_data)
+final_data$self_reported_cholesterol <- ifelse(final_data$self_reported_cholesterol == 1, 2,1)
+write.table(x = final_data, file = paste0(data_path, "pheno_high_chole.txt"), row.names = F, 
+            col.names = T, quote = F, sep = "\t")
+```
+
+Running GWAS:
+```{r eval=FALSE}
+result <- NULL
+setwd("/biobank/ziangzhang")
+system(paste0(plink,
+              " --bfile ", geno_path,"self_European_filtered_data_afterSNP_QC",
+              " --allow-no-sex ",
+              " --freq ",
+              " --hardy ",
+              " --missing ",
+              " --pheno ", data_path ,"pheno_high_chole.txt",
+              " --pheno-name self_reported_cholesterol",
+              " --covar ", data_path,"pheno_high_chole.txt",
+              " --covar-name age,sex,PC1,PC2,PC3,PC4",
+              " --covar-variance-standardize",
+              " --make-bed ",
+              " --glm hide-covar genotypic",
+              " --out ", result_path, "bri_result_high_chol"
+))
+```
+
+
+
+Summary of the GWAS on high cholesterol:
+```{r}
+result2df_full <- fread(file = "data/UKB/bri_result_high_chol.self_reported_cholesterol.glm.logistic.hybrid")
+result2df_joint <- filter(result2df_full, TEST == "GENO_2DF")
+names(result2df_joint)[c(1,3,13)] <- c("CHR", "SNP", "P2")
+result2df_joint <- result2df_joint %>% select(CHR, SNP, POS, P2)
+names(result2df_joint) <- c("CHR", "SNP", "POS", "pvalue")
+
+result1df_additive <- filter(result2df_full, TEST == "ADD")
+names(result1df_additive)[c(1,3,13)] <- c("CHR", "SNP", "P1")
+result1df_additive <- result1df_additive %>% select(CHR, SNP, POS, P1)
+names(result1df_additive) <- c("CHR", "SNP", "POS", "pvalue")
+
+result1df_domin <- filter(result2df_full, TEST == "DOMDEV")
+names(result1df_domin)[c(1,3,13)] <- c("CHR", "SNP", "P1")
+result1df_domin <- result1df_domin %>% select(CHR, SNP, POS, P1)
+names(result1df_domin) <- c("CHR", "SNP", "POS", "pvalue")
+```
+
+Produce a manhattan plot for the 2-df joint GWAS on high cholesterol:
+```{r}
+manhattan(result2df_joint[result2df_joint$pvalue <= 0.05,], p = "pvalue", chr = "CHR", bp = "POS", snp = "SNP", main = "joint test", annotatePval = 1e-8)
+```
+
+Produce a manhattan plot for the dominance GWAS on high cholesterol:
+```{r}
+manhattan(result1df_domin[result1df_domin$pvalue <= 0.05], p = "pvalue", chr = "CHR", bp = "POS", snp = "SNP", main = "dominance test", annotatePval = 1e-5, ylim = c(-log10(0.1), 12))
+```
+
+A manhattan plot for dominance test, focusing on chromosome 19:
+```{r}
+manhattan(result1df_domin[result1df_domin$pvalue <= 0.05 & result1df_domin$CHR == 19,], p = "pvalue", chr = "CHR", bp = "POS", snp = "SNP", main = "dominance test on chromosome 19", annotatePval = 1e-5, ylim = c(-log10(0.1), 12))
+```
+
+Which SNP has significant dominance effect?
+```{r}
+resultdom <- filter(result2df_full, TEST == "DOMDEV")
+result2df <- filter(result2df_full, TEST == "GENO_2DF")
+names(result2df)[c(1,3,13)] <- c("CHR", "SNP", "pvalue")
+names(resultdom)[c(1,3,13)] <- c("CHR", "SNP", "pvalue")
+
+# resultadd <- resultadd %>% select(CHR, SNP, POS, pvalue)
+result2df <- result2df %>% select(CHR, SNP, POS, pvalue)
+resultdom <- resultdom %>% select(CHR, SNP, POS, pvalue)
+
+resultMAF <- fread(file = "data/UKB/bri_result_high_chol.afreq")
+names(resultMAF)[c(1,2)] <- c("CHR", "SNP")
+resultMAF <- resultMAF[, c(1,2,5)]
+result <- inner_join(result2df, resultdom, by = c("SNP", "CHR", "POS"))
+names(result)[4:5] <- c("P-joint", "P-dom")
+result <- inner_join(result, resultMAF, by = c("SNP", "CHR")) 
+names(result)[6] <- c("MAF")
+
+result %>% arrange(`P-dom`) %>% head(10)
+```
+
+The SNPs with most evident dominance effect are rs7412, rs141622900, rs445925 and rs55764104. The first three SNPs are in the APOE gene, and rs445925 is the only SNP with MAF > 0.1.
+
+Study its nearby SNPs:
+```{r eval=FALSE}
+proxy51160 <- read.delim("data/UKB/proxy51160.txt")
+# Ensure the RS_Number column is treated as a character to avoid any formatting issues
+proxy51160$RS_Number <- as.character(proxy51160$RS_Number)
+selected_SNPs_Dprime <- proxy51160 %>% filter(Dprime > 0.2) %>% select(RS_Number)
+
+# Write the RS_Number column to a text file
+write.table(selected_SNPs_Dprime$RS_Number, file = "data/UKB/SNP_list_to_extract.txt", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+plink_cmd <- paste0(plink,
+                    " --bfile ", geno_path, "self_European_filtered_data_afterSNP_QC",
+                    " --extract SNP_list_to_extract.txt",  # Using the list of SNPs
+                    " --make-bed",
+                    " --out ", result_path, "selected_SNP_high_chole")
+# Execute the command
+system(plink_cmd)
+
+# Read the .bed file created by PLINK
+path <- paste0(result_path, "selected_SNP_high_chole.bed")
+tempfile_path <- tempfile()
+snp_readBed(path, backingfile = tempfile_path)
+SNP_data_full <- snp_attach(paste0(tempfile_path, ".rds"))
+
+# Extract relevant information
+SNP_data <- data.frame(IID = SNP_data_full$fam$family.ID, 
+                       Sex = SNP_data_full$fam$sex)
+G <- SNP_data_full$genotypes
+result_matrix <- G[]
+
+# Add ID column to the matrix
+result_matrix <- cbind(SNP_data$IID, result_matrix)
+
+# Create a data frame
+SNP_data_df <- as.data.frame(result_matrix)
+names(SNP_data_df) <- c("IID", SNP_data_full$map$marker.ID)
+
+# Save the data frame
+save(SNP_data_df, file = paste0(result_path, "selected_SNP_high_chole.rda"))
+```
+
+```{r}
+load("data/UKB/selected_SNP_high_chole.rda")
+```
+
+Combined data:
+```{r}
+SNP_data <- SNP_data_df
+names(SNP_data)[1] <- "ID"
+load(file = "data/UKB/final.rda")
+mresult <- merge(SNP_data, pheno_data, by = "ID")
+```
+
+Check their dominance effect:
+```{r}
+SNP_names <- colnames(SNP_data)[-1]
+SNP_names_to_loop <- SNP_names[SNP_names != "rs7412"]
+result_original <- data.frame(SNP = SNP_names_to_loop)
+P_add = numeric()
+beta_dom = numeric()
+P_dom = numeric()
+for (i in 1:length(SNP_names_to_loop)) {
+  GA <- mresult[,c(SNP_names_to_loop[i])]
+  # Estimate minor allele frequency:
+  p <- sqrt(as.numeric(table(GA)/sum(table(GA)))[3])
+  q <- 1 - p
+  # code GD = [-p/q, 1, -q/p] for GA = [0,1,2]
+  GD <- ifelse(GA == 1, 1, 0)
+  GD <- ifelse(GA == 2, -q/p, GD)
+  GD <- ifelse(GA == 0, -p/q, GD)
+  GA <- scale(GA)
+  data_to_fit <- data.frame(GA, GD, Y = mresult$self_reported_cholesterol, PC1 = mresult$PC1, PC2 = mresult$PC2, PC3 = mresult$PC3, PC4 = mresult$PC4, age = mresult$age, sex = mresult$sex)
+  mod <- glm(Y ~ GA + GD + PC1 + PC2 + PC3 + PC4 + age + sex, family = binomial(link = "logit"), data = data_to_fit)
+  P_add[i] <- summary(mod)$coefficients[2,4]
+  P_dom[i] <- summary(mod)$coefficients[3,4]
+  beta_dom[i] <- summary(mod)$coefficients[3,1]
+}
+result_original$beta_dom = beta_dom
+result_original$p_dom = P_dom
+result_original %>% arrange(p_dom) %>% head(10)
+```
+
+Check their GxG interaction with SNP rs7412:
+```{r}
+beta_dom_cr = numeric()
+P_dom_cr = numeric()
+beta_GG = numeric()
+p_GG = numeric()
+for (i in 1:length(SNP_names_to_loop)) {
+  GA <- mresult[,c(SNP_names_to_loop[i])]
+  # Estimate minor allele frequency:
+  p <- sqrt(as.numeric(table(GA)/sum(table(GA)))[3])
+  q <- 1 - p
+  # code GD = [-p/q, 1, -q/p] for GA = [0,1,2]
+  GD <- ifelse(GA == 1, 1, 0)
+  GD <- ifelse(GA == 2, -q/p, GD)
+  GD <- ifelse(GA == 0, -p/q, GD)
+  GA <- scale(GA)
+  G2 <- scale(mresult[,c("rs7412")])
+  data_to_fit <- data.frame(GA, GD, G2, Y = mresult$self_reported_cholesterol, PC1 = mresult$PC1, PC2 = mresult$PC2, PC3 = mresult$PC3, PC4 = mresult$PC4, age = mresult$age, sex = mresult$sex)
+  mod <- glm(Y ~ GA + GD + G2 + GA:G2 + PC1 + PC2 + PC3 + PC4 + age + sex, family = binomial(link = "logit"), data = data_to_fit)
+  P_dom_cr[i] <- summary(mod)$coefficients[3,4]
+  beta_dom_cr[i] <- summary(mod)$coefficients[3,1]
+  beta_GG[i] <- summary(mod)$coefficients[11,1]
+  p_GG[i] <- summary(mod)$coefficients[11,4]
+}
+result_corrected <- data_frame(SNP = SNP_names_to_loop, beta_dom_cr = beta_dom_cr, p_dom_cr = P_dom_cr, beta_GG = beta_GG, p_GG = p_GG)
+result_corrected %>% arrange(p_GG) %>% head(10)
+```
+
+Some SNPs with evidence in GxG interaction.
+```{r}
+result_compare <- merge(result_original[,c(1,3)], result_corrected[,c(1,5)], by = "SNP")
+# result_compare %>% arrange(p_dom) %>% filter(p_dom <= (0.05/nrow(result_compare)))
+result_compare %>% arrange(p_GG) %>% filter(p_GG <= (0.05/nrow(result_compare)))
+```
+
+Plot the relationship between p-values for GxG interaction and dominance effect. 
+```{r}
+plot(p_dom ~ p_GG, result_compare, type = "p", cex = 0.5)
+abline(lm(p_dom ~ p_GG, result_compare), col = "red")
+```
+
+Histograms of the p-values for GxG interaction and dominance effect:
+```{r}
+hist(p_GG, breaks = 30, col = "lightblue", main = "Histogram of p-values for GxG interaction", xlab = "p-value")
+hist(P_dom, breaks = 30, col = "lightblue", main = "Histogram of p-values for Dominance Effect", xlab = "p-value")
+```
+
+Also, list the top 10 SNPs with significant dominance effect and the proportion of SNPs with significant GxG interaction:
+```{r}
+result_compare %>% filter(p_dom <= 0.05) %>% arrange(p_GG)
+selected_p_GG <- result_compare %>% filter(p_dom <= 0.05) %>% pull(p_GG)
+mean(selected_p_GG <= 0.05)
+```
+
+
+
+### *Analysis*
+
+To illustrate the usage of the proposed indirect test for the $GxE$ effect and its corresponding joint test, we apply the method to the binary trait self-reported high cholesterol (Data-Field: 20002; Coding: 1473) from the UK Biobank. 
+
+To carry out the analysis, we selected genotyped SNPs with MAF greater than 0.01, genotyping rate greater than 0.8, and Hardy-Weinberg equilibrium p-value greater than 1e-50. 
+We restricted our analysis to the self-reported European participants, with the related individuals removed based on the kinship coefficient (Data-Field 22021).
+We further filtered out individuals with missing rate greater than 0.2; the final sample consists of 276,658 approximately unrelated individuals.
+The prevalence rate of self-reported high cholesterol in the final sample is 0.121 (0.151 in male, 0.095 in female).
+
+
+We then use logistic regression to analyze the genetic association between each SNP with
+the binary trait, accounting for covariate effects of age (Data-Field 21022), sex (Data-Field 31) and first four principal components (PC) constructed from genetic data.
+We carry out the GWAS using both the (2-df) joint test and the (1-df) dominance test.
+
+
+The GWAS results are displayed at below, using both the proposed (1-df) dominance and the (2-df) joint test.
+```{r}
+result2df_joint_to_miami <- result2df_joint %>% rename(CHR = CHR, SNP = SNP, BP = POS, P = pvalue)
+result1df_domin_to_miami <- result1df_domin %>% rename(CHR = CHR, SNP = SNP, BP = POS, P = pvalue)
+result1df_add_to_miami <- result1df_additive %>% rename(CHR = CHR, SNP = SNP, BP = POS, P = pvalue)
+
+pdf(file = "output/manhattan_high_chole.pdf", width = 12, height = 6)
+par(mfrow=c(2,1))
+par(mar=c(0,5,3,3))
+manhattan(result2df_joint_to_miami[result2df_joint_to_miami$P <= 0.05,],ylim=c(0,150),cex=1,cex.lab=1.5,font.lab=2,font.axis=2,cex.axis=1.5,las=2)
+par(mar=c(5,5,3,3))
+manhattan(result1df_domin_to_miami[result1df_domin_to_miami$P <= 0.05,],ylim=c(20,0),cex=1,cex.lab=1.5,font.lab=2,font.axis=2,cex.axis=1.5,las=2,xlab="",xaxt="n")
+dev.off()
+par(mfrow=c(1,1))
+
+pdf(file = "output/manhattan_high_chole_additive.pdf", width = 12, height = 6)
+par(mar=c(0,5,3,3))
+manhattan(result1df_add_to_miami[result1df_add_to_miami$P <= 0.05,],ylim=c(0,80),cex=1,cex.lab=1.5,font.lab=2,font.axis=2,cex.axis=1.5,las=2)
+dev.off()
+```
+
+For QQ plot and histograms:
+```{r}
+png(file = "output/qqplot_dom.png", width = 400, height = 400)
+gaston::qqplot.pvalues(result1df_domin_to_miami$P, main = "", cex = 0.5)
+dev.off()
+
+png(file = "output/qqplot_joint.png", width = 400, height = 400)
+gaston::qqplot.pvalues(result2df_joint_to_miami$P, main = "", cex = 0.5)
+dev.off()
+
+png(file = "output/hist_dom.png", width = 400, height = 400)
+hist(result1df_domin_to_miami$P, breaks = 30, freq = F, xlab = "P-value", main = "", cex = 2)
+dev.off()
+
+png(file = "output/hist_joint.png", width = 400, height = 400)
+hist(result2df_joint_to_miami$P, breaks = 30, freq = F, xlab = "P-value", main = "", cex = 2)
+dev.off()
+```
+
+
+Based on the mirrored Manhattan plot, there are several regions with genome-wide significant signals in the joint test. 
+Among them, the region on chromosome 19 shows a strong dominance effect, with the top SNP rs7412 (p-value = 1.6400e-19) in the APOE gene, rs141622900 (p-value = 6.68521e-14), rs445925 (p-value = 1.59293e-11) and rs72654473 (p-value = 3.61266e-10) near the APOC1 gene.
+This significant dominance effect suggests evidence of possible $GxE$ effect in the region of the APOE gene.
+This is not unexpected, given the existing literature on the haplotype effect of APOE gene on cholesterol levels, which denotes the interaction between SNPs nearby the APOE gene.
+
+To better identify whether the non-additive effect is likely caused by the latent interactions, we investigated the interaction effect between the identified SNP rs7412 and other SNPs in the region.
+We selected 67 SNPs with D-prime larger than 0.2 within 10,000 bps of the SNP rs7412, and performed the GxG interaction analysis.
+```{r}
+png(file = "output/hist_pdom.png", width = 500, height = 500)
+par(mar=c(5,5,3,3))
+hist(result_compare$p_dom, breaks = 30, col = "lightblue", main = "Indirect Test", xlab = "p-value", freq = F, cex=2, cex.lab=2, font.lab=2, font.axis=1, cex.axis=2, cex.main = 2)
+dev.off()
+png(file = "output/hist_pGG.png", width = 500, height = 500)
+par(mar=c(5,5,3,3))
+hist(result_compare$p_GG, breaks = 30, col = "lightblue", main = "Interaction Test", xlab = "p-value", freq = F, cex=2, cex.lab=2, font.lab=2, font.axis=1, cex.axis=2, cex.main = 2)
+dev.off()
+```
+
+Indeed, we found 11 SNPs have significant GxG interaction effect with rs7412 at the significance level of 0.05, after Bonferroni correction. 
+Table below shows the SNPs with significant GxG interaction effect with rs7412.
+```{r}
+proxy51160 <- read.delim("data/UKB/proxy51160.txt")
+# Ensure the RS_Number column is treated as a character to avoid any formatting issues
+proxy51160$RS_Number <- as.character(proxy51160$RS_Number)
+selected_SNPs_Dprime <- proxy51160 %>% filter(Dprime > 0.2) %>% select(RS_Number)
+result_compare <- merge(result_original, result_corrected, by = "SNP")
+result_compare_filtered <- result_compare %>% arrange(p_GG) %>% filter(p_GG <= (0.05/nrow(result_compare)))
+table_to_show <- proxy51160 %>% rename(SNP = RS_Number) %>% select(SNP, MAF, Dprime, R2, Distance) %>% merge(result_compare_filtered, by = "SNP") %>% rename(`P-value:Indirect` = p_dom, `P-value:Interaction` = p_GG, `beta:indirect` = beta_dom, `betaGG` = beta_GG) %>% arrange(`P-value:Interaction`) %>% select(SNP, MAF, Dprime, R2, Distance, `P-value:Indirect`, `P-value:Interaction`, `beta:indirect`, `betaGG`)
+```
+
+```{r}
+sum(table_to_show$`P-value:Indirect`<=0.05)
+```
+
+```{r}
+## Only show the 4 scientific digits of the last two columns to f
+options(digits = 4)
+table_to_show$`beta:indirect` <- round(table_to_show$`beta:indirect`, 4)
+table_to_show
+```
+
+
+Finally, we also applied the proposed indirect test to the 11 SNPs with significant interaction effect, and found that 5 of them have p-values less than 0.05 based on the indirect test.
+
+
+
+To double-check, we can also see if the dominance effect has been reduced by the correction of GxG interactions:
+```{r}
+library(ggplot2)
+library(dplyr)
+
+result_compare %>%
+  filter(p_dom <= 0.05) %>%
+  arrange(p_dom) %>%  # Sort by p_dom to identify the top SNPs
+  mutate(is_top_snp = if_else(p_dom <= 5e-8, "Top SNP", "Other SNP")) %>%
+  ggplot(aes(x = -log10(p_dom), y = -log10(p_dom_cr), color = is_top_snp)) + 
+  geom_point(size = 3) +
+  geom_text(aes(label = if_else(is_top_snp == "Top SNP", as.character(SNP), NA_character_)), 
+            vjust = -1.0, hjust = -0.2, check_overlap = F, size = 8) +  # Increased label size
+  scale_color_manual(values = c("Top SNP" = "blue", "Other SNP" = "black")) +
+  geom_abline(intercept = 0, slope = 1, color = "red") + 
+  labs(x = "-log10(p), before accounting for interaction", 
+       y = "-log10(p), accounting for interaction",
+       color = "SNP Category") +
+  coord_cartesian(xlim = c(0, 20), ylim = c(0, 3)) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        text = element_text(size = 24.5),
+        axis.text = element_text(size = 27))  # Increase base font size for the entire plot
+ggsave("output/dominance_effect_correction_pval.png", width = 7, height = 7)
+```
+
+```{r}
+# Compute the SE based on p-val and beta
+compute_se <- function(p_val, beta) {
+  z_score <- qnorm(1 - p_val / 2)
+  se <- abs(beta / z_score)
+  return(se)
+}
+```
+
+
+```{r}
+result_compare %>%
+  mutate(se_dom = compute_se(p_dom, beta_dom),
+         se_dom_cr = compute_se(p_dom_cr, beta_dom_cr)) %>%
+  filter(p_dom <= 0.05) %>%
+  mutate(highlight = if_else(p_dom <= 5e-8, "Highlight", "Normal"),
+         label = if_else(p_dom <= 5e-8, as.character(SNP), NA_character_)) %>%
+  ggplot(aes(x = abs(beta_dom), y = abs(beta_dom_cr), color = highlight)) + 
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = abs(beta_dom_cr) - se_dom_cr, ymax = abs(beta_dom_cr) + se_dom_cr), width = 0, size = 0.2, alpha = 0.5) +
+  geom_errorbarh(aes(xmin = abs(beta_dom) - se_dom, xmax = abs(beta_dom) + se_dom), height = 0, size = 0.2, alpha = 0.5) +
+  geom_text(aes(label = label), vjust = -1, hjust = -0.5, check_overlap = TRUE, size = 8) +
+  scale_color_manual(values = c("Highlight" = "blue", "Normal" = "black")) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  scale_x_continuous(breaks = c(0, 0.02, 0.04, 0.06, 0.08)) +
+  coord_cartesian(xlim = c(0, 0.1), ylim = c(0, 0.05)) +
+  labs(x = expression(group("|", hat(beta)[D], "|") ~ "before accounting for interaction"),
+       y = expression(group("|", hat(beta)[D], "|") ~ "after accounting for interaction"),  # Corrected expression for y-axis
+       color = "Significance Level") +
+  theme_minimal() +
+  theme(text = element_text(size = 24.5), 
+        axis.text = element_text(size = 27),
+        legend.position = "none")
+
+ggsave("output/dominance_effect_correction_beta.png", width = 7, height = 7)
+```
+
+
+Produce long table of summary in the supplement:
+```{r}
+table_to_show <- proxy51160 %>% rename(SNP = RS_Number) %>% select(SNP, MAF, Dprime, R2, Distance) %>% merge(result_compare, by = "SNP") %>% rename(`P-value:Indirect` = p_dom, `P-value:Interaction` = p_GG, `beta:indirect` = beta_dom, `betaGG` = beta_GG) %>% arrange(`P-value:Interaction`) %>% select(SNP, MAF, Dprime, R2, Distance, `P-value:Indirect`, `P-value:Interaction`, `beta:indirect`, `betaGG`)
+```
+
+```{r}
+table_to_show_formatted <- table_to_show %>%
+  mutate(across(.cols = c((ncol(.)-3):ncol(.)),  # Selects the last four columns
+                .fns = ~ formatC(., format = "e", digits = 3)))
+
+latex_table <- xtable(table_to_show_formatted, caption = "Detailed SNP Information", label = "tab:SNPinfo")
+print(latex_table, type = "latex", include.rownames = FALSE, floating = FALSE,
+      sanitize.text.function = identity,  # Important to allow LaTeX handling of special characters
+      table.placement = "ht")
+```
+
+
+
+
+
+
+
+

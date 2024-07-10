@@ -1,0 +1,123 @@
+---
+title: "UKB_permutation"
+author: "Ziang Zhang"
+date: "2024-05-16"
+output: pdf
+editor_options:
+  chunk_output_type: console
+---
+
+## Introduction
+
+Use permuted trait to assess the empirical p-value of the indirect and the joint test.
+
+```{r eval = F}
+.libPaths(c("~/lib", .libPaths()))
+
+### Location:
+biobank_location <- "/biobank/ziangzhang/"
+geno_path <- biobank_location
+plink <- paste0(biobank_location, "plink2")
+plink19 <- paste0(biobank_location, "plink")
+result_path <- "/u/ziangzhang/eu_result/"
+data_path <- "/u/ziangzhang/eu_data/"
+#### Analysis using White British population:
+library(hudson)
+library(stringr)
+library(data.table)
+library(tidyverse)
+library(bigsnpr)
+library(bigstatsr)
+library(progress)
+library(foreach)
+library(parallel)
+library(qqman)
+library(HardyWeinberg)
+library(SPCompute)
+library(Hmisc)
+```
+
+```{r eval = F}
+load(file = paste0(data_path, "final.rda"))
+final_data <- pheno_data
+colnames(final_data)[1] <- "IID"
+final_data <- cbind(FID = final_data$IID ,final_data)
+final_data$self_reported_cholesterol <- ifelse(final_data$self_reported_cholesterol == 1, 2,1)
+# permute the phenotype
+set.seed(123)
+final_data$self_reported_cholesterol <- sample(final_data$self_reported_cholesterol, replace = F)
+write.table(x = final_data, file = paste0(data_path, "pheno_high_chole_permut.txt"), row.names = F, 
+            col.names = T, quote = F, sep = "\t")
+result <- NULL
+setwd("/biobank/ziangzhang")
+system(paste0(plink,
+              " --bfile ", geno_path,"self_European_filtered_data_afterSNP_QC",
+              " --allow-no-sex ",
+              " --freq ",
+              " --hardy ",
+              " --missing ",
+              " --pheno ", data_path ,"pheno_high_chole_permut.txt",
+              " --pheno-name self_reported_cholesterol",
+              " --covar ", data_path,"pheno_high_chole_permut.txt",
+              " --covar-name age,sex,PC1,PC2,PC3,PC4",
+              " --covar-variance-standardize",
+              " --make-bed ",
+              " --glm hide-covar genotypic",
+              " --out ", result_path, "bri_result_high_chol_permut"
+))
+```
+
+```{r}
+compute_gc <- function (x, logscale = FALSE, z = FALSE, df = 1) {
+  v <- x[!is.na(x)]
+  n <- length(v)
+  if (z) {
+    obs <- v^2
+    exp <- qchisq(log(1:n/n), df, lower.tail = FALSE, log.p = TRUE)
+  }
+  else {
+    if (!logscale) {
+      obs <- qchisq(v, df, lower.tail = FALSE)
+      exp <- qchisq(1:n/n, df, lower.tail = FALSE)
+    }
+    else {
+      obs <- qchisq(-log(10) * v, df, lower.tail = FALSE, 
+                    log.p = TRUE)
+      exp <- qchisq(log(1:n/n), df, lower.tail = FALSE, 
+                    log.p = TRUE)
+    }
+  }
+  lambda <- median(obs)/median(exp)
+  return(lambda)
+}
+```
+
+
+```{r}
+result <- read.table("data/UKB/bri_result_high_chol_permut.self_reported_cholesterol.glm.logistic.hybrid", header = T, comment.char = "")
+resultDom <- result %>% filter(TEST == "DOMDEV")
+## Compute GC
+compute_gc(resultDom$P, df = 1) # 1.00369
+png(file = "output/qqplot_dom_permut.png", width = 400, height = 400)
+gaston::qqplot.pvalues(resultDom$P, main = "", cex = 0.5)
+dev.off()
+
+png(file = "output/hist_dom_permut.png", width = 400, height = 400)
+hist(resultDom$P, breaks = 20, freq = F, xlab = "P-value", main = "", cex = 2)
+dev.off()
+```
+
+```{r}
+resultjoint <- result %>% filter(TEST == "GENO_2DF")
+## Compute GC for the joint test:
+compute_gc(resultjoint$P, df = 2) # 0.996285
+
+png(file = "output/qqplot_joint_permut.png", width = 400, height = 400)
+gaston::qqplot.pvalues(resultjoint$P, main = "", cex = 0.5)
+dev.off()
+
+png(file = "output/hist_joint_permut.png", width = 400, height = 400)
+hist(resultjoint$P, breaks = 20, freq = F, xlab = "P-value", main = "", cex = 2)
+dev.off()
+```
+
