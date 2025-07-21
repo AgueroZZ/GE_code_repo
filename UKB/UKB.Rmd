@@ -9,7 +9,7 @@ editor_options:
 
 ```{r, eval=FALSE}
 .libPaths(c("~/lib", .libPaths()))
-### Location:
+### Setup directory:
 biobank_location <- "/biobank/ziangzhang/"
 geno_path <- biobank_location
 plink <- paste0(biobank_location, "plink2")
@@ -20,6 +20,7 @@ data_path <- "/u/ziangzhang/eu_data/"
 
 
 ```{r load-packages, message=FALSE, warning=FALSE}
+### Setup R libraries:
 library(hudson)
 library(tidyverse)
 library(stringr)
@@ -41,38 +42,19 @@ library(Hmisc)
 ### *Code*
 
 
-First, process the phenotype data:
+Process the data:
 ```{r, eval=FALSE}
+### Filter the selected variables
 bd <- read.table(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", nrows = 3)
 bd_names <- names(bd)
-names_want <- grep("f.20002.0.",bd_names,value = T)
-bd_want <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_want))
-check_asthma <- function(row){
-  if(any(na.omit(row) %in% 1111)) 1
-  else 0
-}
-check_hypertension <- function(row){
-  if(any(na.omit(row) %in% 1065)) 1
-  else 0
-}
-asthma <- apply(bd_want[,-1], 1, check_asthma)
-ncol_bd <- ncol(bd_want)
-hypertension <- apply(bd_want[,-1], 1, check_hypertension)
-pheno_data <- data.frame(ID = bd_want$f.eid, asthma = asthma, hypertension = hypertension)
-names_want2 <- grep("f.21001.0.",bd_names,value = T)
-BMI_data <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_want2))
-names(BMI_data) <- c("ID", "BMI")
-pheno_data <- merge(pheno_data, BMI_data, by = "ID")
-names_want3 <- grep("f.21022.",bd_names,value = T)
-age_data <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_want3))
-names(age_data) <- c("ID", "age")
-pheno_data <- merge(pheno_data, age_data, by = "ID")
-names_want_sex <- grep("f.22001.",bd_names,value = T)
-sex_data <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_want_sex))
+pheno_data <- data.frame(ID = bd_want$f.eid)
+names_age <- grep("f.21022.",bd_names,value = T)
+pheno_data <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_age))
+names(pheno_data) <- c("ID", "age")
+names_sex <- grep("f.22001.",bd_names,value = T)
+sex_data <- fread(paste0(geno_path, "ukb47570.tab"), header=TRUE, sep="\t", select = c("f.eid",names_sex))
 names(sex_data) <- c("ID", "sex")
 pheno_data <- merge(pheno_data, sex_data, by = "ID")
-
-### Self-reported cholesterol:
 check_self_reported_cholesterol <- function(row){
   if(any(na.omit(row) %in% 1473)) 1
   else 0
@@ -80,10 +62,8 @@ check_self_reported_cholesterol <- function(row){
 self_reported_cholesterol <- apply(bd_want[,-1], 1, check_self_reported_cholesterol)
 self_reported_cholesterol_data <- data.frame(ID = bd_want$f.eid, self_reported_cholesterol = self_reported_cholesterol)
 pheno_data <- merge(pheno_data, self_reported_cholesterol_data, by = "ID")
-```
 
-Selection of individuals:
-```{r, eval=FALSE}
+### Filter the selected individuals
 names_want_pop <- grep("f.21000.0",bd_names,value = T)
 names_want_pop_genetic_confirmed <- grep("f.22006",bd_names,value = T)
 names_want_pop_kin <- grep("f.22021.0.0", bd_names,value = T)
@@ -92,10 +72,9 @@ pop_want_European <- pop_want %>% filter(f.21000.0.0 == 1001, !is.na(f.22006.0.0
 pop_want_European <- pop_want_European %>% filter(f.22021.0.0 == 0)
 European_ID <- pop_want_European$f.eid
 pheno_data <- pheno_data %>% filter(ID %in% European_ID)
-```
 
-Merge the genotype data for the selected individuals:
-```{r, eval=FALSE}
+
+### Merge all the genotype data from individual chromosomes
 matrix_to_write <- cbind(European_ID,European_ID)
 write.table(x = matrix_to_write, file = paste0(geno_path, "self_report_European.txt"), row.names = F, col.names = F)
 result <- NULL
@@ -114,11 +93,6 @@ system(paste0(plink19,
               " --merge-list ", "merge_list_European.txt",
               " --make-bed",
               " --out ", "self_European_merged_data"))
-```
-
-
-Filter out SNPs with HWD, low MAF or low genotyping rate, and individuals with high missing rate:
-```{r, eval=FALSE}
 system(paste0(plink,
               paste(" --bfile", "self_European_merged_data"),
               " --hwe 1e-50",
@@ -128,10 +102,9 @@ system(paste0(plink,
               " --make-bed ",
               paste(" --out", "self_European_filtered_data_afterSNP_QC")
 ))
-```
 
-Run PCA:
-```{r eval=FALSE}
+
+### Computing other needed variables
 system(paste0(plink,
               " --bfile ", "self_European_filtered_data_afterSNP_QC",
               " --pca approx 4 ",
@@ -142,10 +115,6 @@ colnames(newPCs) <- c("FID", "IID", "PC1", "PC2", "PC3", "PC4")
 newPCs$ID <- newPCs$IID
 final_data <- inner_join(newPCs, pheno_data, by = "ID")
 save(final_data, file = paste0(data_path, "final_data.rda"))
-```
-
-Write out the phenotype for GWAS:
-```{r eval=FALSE}
 load(file = paste0(data_path, "final.rda"))
 final_data <- pheno_data
 colnames(final_data)[1] <- "IID"
@@ -174,6 +143,22 @@ system(paste0(plink,
               " --glm hide-covar genotypic",
               " --out ", result_path, "bri_result_high_chol"
 ))
+
+system(paste0(plink,
+              " --bfile ", geno_path,"self_European_filtered_data_afterSNP_QC",
+              " --allow-no-sex ",
+              " --freq ",
+              " --hardy ",
+              " --missing ",
+              " --pheno ", data_path ,"pheno_high_chole.txt",
+              " --pheno-name self_reported_cholesterol",
+              " --covar ", data_path,"pheno_high_chole.txt",
+              " --covar-name age,sex,PC1,PC2,PC3,PC4",
+              " --covar-variance-standardize",
+              " --make-bed ",
+              " --glm hide-covar",
+              " --out ", result_path, "bri_result_high_chol_additive"
+))
 ```
 
 
@@ -186,7 +171,9 @@ names(result2df_joint)[c(1,3,13)] <- c("CHR", "SNP", "P2")
 result2df_joint <- result2df_joint %>% select(CHR, SNP, POS, P2)
 names(result2df_joint) <- c("CHR", "SNP", "POS", "pvalue")
 
-result1df_additive <- filter(result2df_full, TEST == "ADD")
+result1df_additive_full <- fread(file = "data/UKB/bri_result_high_chol_additive.self_reported_cholesterol.glm.logistic.hybrid")
+result1df_additive <- filter(result1df_additive_full, TEST == "ADD")
+
 names(result1df_additive)[c(1,3,13)] <- c("CHR", "SNP", "P1")
 result1df_additive <- result1df_additive %>% select(CHR, SNP, POS, P1)
 names(result1df_additive) <- c("CHR", "SNP", "POS", "pvalue")
@@ -406,7 +393,7 @@ par(mfrow=c(1,1))
 
 pdf(file = "output/manhattan_high_chole_additive.pdf", width = 12, height = 6)
 par(mar = c(5, 5, 3, 3))  
-manhattan(result1df_add_to_miami[result1df_add_to_miami$P <= 0.05,],ylim=c(0,80),cex=1,cex.lab=1.5,font.lab=2,font.axis=2,cex.axis=1.5,las=2)
+manhattan(result1df_add_to_miami[result1df_add_to_miami$P <= 0.05,],ylim=c(0,120),cex=1,cex.lab=1.5,font.lab=2,font.axis=2,cex.axis=1.5,las=2)
 dev.off()
 ```
 
@@ -428,6 +415,31 @@ png(file = "output/hist_joint.png", width = 400, height = 400)
 hist(result2df_joint_to_miami$P, breaks = 30, freq = F, xlab = "P-value", main = "", cex = 2)
 dev.off()
 ```
+
+
+```{r}
+compute_gc_lambda <- function(pvals, df = 1) {
+  if (!is.numeric(pvals) || any(is.na(pvals))) {
+    pvals <- as.numeric(pvals)
+    pvals <- pvals[!is.na(pvals)]
+  }
+  if (!is.numeric(df) || length(df) != 1 || df <= 0) {
+    stop("df must be a positive number.")
+  }
+
+  pvals <- pmin(pmax(pvals, 1e-300), 1)
+
+  chisq_vals <- qchisq(1 - pvals, df = df)
+
+  lambda_gc <- median(chisq_vals) / qchisq(0.5, df = df)
+
+  return(lambda_gc)
+}
+compute_gc_lambda(pvals = result1df_domin_to_miami$P, df = 1)
+compute_gc_lambda(pvals = result1df_add_to_miami$P, df = 1)
+compute_gc_lambda(pvals = result2df_joint_to_miami$P, df = 2)
+```
+
 
 
 Based on the mirrored Manhattan plot, there are several regions with genome-wide significant signals in the joint test. 
